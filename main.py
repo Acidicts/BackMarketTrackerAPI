@@ -114,8 +114,12 @@ app = FastAPI(title="BackMarket Product API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=[
+        "https://back-market-tracker-page-ui.vercel.app", # Your Vercel frontend
+        "http://localhost:3000",                          # For local development
+        "http://127.0.0.1:3000"
+    ],
+    allow_credentials=True, # Change this to True if you want to support cookies/auth later
     allow_methods=["*"],
     allow_headers=["*"],
 )
