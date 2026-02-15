@@ -1,0 +1,47 @@
+services:
+  backmarket-api:
+    build: .
+    container_name: backmarket-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - backmarket-data:/app/db
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./db/backmarket.db
+    restart: unless-stopped
+
+  # Optional: Use PostgreSQL instead of SQLite
+  # Uncomment the following to use PostgreSQL:
+
+  # backmarket-api-postgres:
+  #   build: .
+  #   container_name: backmarket-api
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - DATABASE_URL=postgresql+asyncpg://backmarket:backmarket@postgres:5432/backmarket
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   restart: unless-stopped
+
+  # postgres:
+  #   image: postgres:16-alpine
+  #   container_name: backmarket-postgres
+  #   environment:
+  #     - POSTGRES_USER=backmarket
+  #     - POSTGRES_PASSWORD=backmarket
+  #     - POSTGRES_DB=backmarket
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U backmarket"]
+  #     interval: 5s
+  #     timeout: 5s
+  #     retries: 5
+  #   restart: unless-stopped
+
+volumes:
+  backmarket-data:
+  # postgres-data:
+
