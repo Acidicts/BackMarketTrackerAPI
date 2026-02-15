@@ -146,6 +146,7 @@ class ProductInfo(BaseModel):
     seller: str | None = None
     warranty: str | None = None
     url: str
+    refreshing: bool = False
 
 
 async def scrape_backmarket_product(url: str, save_to_db: bool = True) -> ProductInfo:
@@ -288,6 +289,15 @@ async def scrape_backmarket_product(url: str, save_to_db: bool = True) -> Produc
     return product_info
 
 
+async def background_scrape(url: str):
+    """Scrape a product in the background and update the database."""
+    try:
+        await scrape_backmarket_product(url, save_to_db=True)
+        print(f"Background scrape completed for {url}")
+    except Exception as e:
+        print(f"Background scrape failed for {url}: {e}")
+
+
 # Catch-all OPTIONS handler for CORS preflight requests
 @app.options("/{rest_of_path:path}")
 async def preflight_handler(rest_of_path: str, response: Response):
@@ -302,11 +312,37 @@ async def preflight_handler(rest_of_path: str, response: Response):
 async def get_product_info(url: str = Query(..., description="BackMarket product URL")):
     """
     Get information about a BackMarket product.
-
-    Pass the full BackMarket product URL as a query parameter.
-    Example: /get?url=https://www.backmarket.com/en-us/p/iphone-13-128-gb-midnight-unlocked/...
+    If the product is already tracked, returns cached data immediately
+    and triggers a background refresh. If new, scrapes synchronously.
     """
-    return await scrape_backmarket_product(url)
+    if "backmarket." not in url:
+        raise HTTPException(status_code=400, detail="URL must be a BackMarket product URL")
+    
+    # Check if product already exists in the database
+    async with async_session() as session:
+        result = await session.execute(select(Product).where(Product.url == url))
+        product = result.scalar_one_or_none()
+    
+    if product:
+        # Product exists — return cached data immediately and refresh in background
+        asyncio.create_task(background_scrape(url))
+        return ProductInfo(
+            title=product.title,
+            price=str(product.current_price) if product.current_price else None,
+            currency=product.currency,
+            image_url=product.image_url,
+            description=product.description,
+            seller=product.seller,
+            condition=product.condition,
+            warranty=product.warranty,
+            url=product.url,
+            refreshing=True
+        )
+    else:
+        # New product — must scrape synchronously to have any data
+        product_info = await scrape_backmarket_product(url, save_to_db=True)
+        product_info.refreshing = False
+        return product_info
 
 
 class PricePoint(BaseModel):
@@ -593,6 +629,7 @@ async def list_tracked_products():
                 "title": p.title,
                 "current_price": p.current_price,
                 "currency": p.currency,
+                "image_url": p.image_url,
                 "created_at": p.created_at,
                 "updated_at": p.updated_at,
             }
