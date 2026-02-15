@@ -1,6 +1,8 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from pydantic import BaseModel
 from bs4 import BeautifulSoup
 import json
@@ -114,15 +116,24 @@ app = FastAPI(title="BackMarket Product API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://back-market-tracker-page-ui.vercel.app", # Your Vercel frontend
-        "http://localhost:3000",                          # For local development
-        "http://127.0.0.1:3000"
-    ],
-    allow_credentials=True, # Change this to True if you want to support cookies/auth later
+    allow_origins=["*"],  # Public API with no authentication
+    allow_credentials=False,  # No cookies/auth used; avoids browser tracking prevention
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+
+# Custom middleware to ensure CORS headers on every response (safety net for Cloudflare)
+class CORSHeaderMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+
+app.add_middleware(CORSHeaderMiddleware)
 
 
 class ProductInfo(BaseModel):
@@ -275,6 +286,16 @@ async def scrape_backmarket_product(url: str, save_to_db: bool = True) -> Produc
             await session.commit()
 
     return product_info
+
+
+# Catch-all OPTIONS handler for CORS preflight requests
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str, response: Response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
 
 
 @app.get("/get", response_model=ProductInfo)
