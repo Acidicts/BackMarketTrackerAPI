@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from bs4 import BeautifulSoup
@@ -110,6 +111,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="BackMarket Product API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class ProductInfo(BaseModel):
