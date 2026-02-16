@@ -15,6 +15,16 @@ from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 import asyncio
 import os
+import sys
+
+# Ensure asyncio on Windows uses the ProactorEventLoop so subprocesses (Playwright) work.
+# Without this Playwright will raise NotImplementedError when it tries to spawn browsers.
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except AttributeError:
+        # policy not available on very old Python versions — ignore
+        pass
 
 # Use SQLite by default, PostgreSQL if DATABASE_URL is set
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./db/backmarket.db")
@@ -179,6 +189,7 @@ async def scrape_backmarket_product(
     wait_for_price_and_title: bool = False,
     max_attempts: int | None = None,
     retry_delay: float = 3.0,
+    allow_stylesheets: bool = False,
 ) -> ProductInfo:
     """Scrape product information from a BackMarket product page.
 
@@ -193,76 +204,283 @@ async def scrape_backmarket_product(
 
     attempts = 0
     html = None
+    rendered_price_text: str | None = None
 
     while True:
         attempts += 1
 
+        # 1) Fast HTTP fetch first (no subprocesses) — covers most pages that include structured data/meta tags
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-                context = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1920, "height": 1080},
-                    locale="en-GB",
-                )
-                page = await context.new_page()
-                # set reasonable timeouts for this page
-                page.set_default_navigation_timeout(60000)
-                page.set_default_timeout(60000)
+            import httpx
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-GB,en;q=0.9",
+            }
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15.0) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200 and resp.text:
+                    # quick pre-parse to determine if this HTML already contains usable data
+                    quick_soup = BeautifulSoup(resp.text, "html.parser")
+                    quick_title = False
+                    quick_price = False
 
-                # Block large/unnecessary resources (images/fonts/analytics) to speed navigation
-                async def _block_resource(route, request):
-                    if request.resource_type in ("image", "media", "font", "stylesheet"):
-                        await route.abort()
-                    else:
-                        await route.continue_()
+                    # JSON-LD quick check
+                    _json_ld = quick_soup.find("script", type="application/ld+json")
+                    if _json_ld:
+                        try:
+                            _data = json.loads(_json_ld.string or "{}")
+                            if isinstance(_data, list):
+                                for item in _data:
+                                    if item.get("@type") == "Product":
+                                        _data = item
+                                        break
+                            if _data.get("@type") == "Product":
+                                quick_title = bool(_data.get("name"))
+                                offers = _data.get("offers") or {}
+                                if isinstance(offers, list) and offers:
+                                    offers = offers[0]
+                                quick_price = bool(offers.get("price"))
+                        except Exception:
+                            pass
 
-                await context.route("**/*", _block_resource)
+                    # fallback quick checks
+                    if not quick_title:
+                        quick_title = bool(quick_soup.find("h1"))
+                    if not quick_price:
+                        if quick_soup.find("meta", property="product:price:amount"):
+                            quick_price = True
+                        elif quick_soup.find(attrs={"itemprop": "price"}):
+                            quick_price = True
 
-                # Navigate using DOMContentLoaded (avoids indefinite network activity from analytics)
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                except Exception:
-                    # second attempt with a longer timeout before giving up
-                    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                    if quick_title or quick_price:
+                        html = resp.text
+        except Exception:
+            # ignore HTTP errors — we'll try Playwright below if necessary
+            html = html
 
-                # Prefer waiting for JSON-LD or explicit price meta tag (fastest path).
-                try:
-                    await page.wait_for_selector('script[type="application/ld+json"]', timeout=12000)
-                except Exception:
+        # 2) If HTTP fetch didn't return usable HTML (or page requires JS), fall back to Playwright
+        if not html:
+            try:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                    context = await browser.new_context(
+                        user_agent=(
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+                        ),
+                        viewport={"width": 1920, "height": 1080},
+                        locale="en-GB",
+                    )
+                    page = await context.new_page()
+                    # set reasonable timeouts for this page
+                    page.set_default_navigation_timeout(60000)
+                    page.set_default_timeout(60000)
+
+                    # Block large/unnecessary resources (images/fonts/analytics) to speed navigation
+                    async def _block_resource(route, request):
+                        # allow opt-in to load stylesheets when necessary (helps pages that rely on CSS-driven rendering)
+                        blocked = ("image", "media", "font")
+                        if not allow_stylesheets:
+                            blocked = blocked + ("stylesheet",)
+                        if request.resource_type in blocked:
+                            await route.abort()
+                        else:
+                            await route.continue_()
+
+                    await context.route("**/*", _block_resource)
+
+                    # Navigate using DOMContentLoaded (avoids indefinite network activity from analytics)
                     try:
-                        await page.wait_for_selector('meta[property="product:price:amount"]', timeout=12000)
+                        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
                     except Exception:
-                        # Best-effort fallback for pages that render slowly
+                        # second attempt with a longer timeout before giving up
+                        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+
+                    # Prefer waiting for JSON-LD *or* any price-related selector (meta, itemprop, visible price classes).
+                    # This increases the chance we capture JS-updated prices without waiting for full networkidle.
+                    try:
+                        await page.wait_for_selector(
+                            'script[type="application/ld+json"], meta[property="product:price:amount"], [itemprop="price"], [data-testid*="price"], [data-qa*="price"], [data-test*="price"], [data-test-id*="price"], .price, .price-amount, .product-price, span[class*=price]',
+                            timeout=12000,
+                        )
+                    except Exception:
+                        # best-effort short pause if nothing matched
                         await page.wait_for_timeout(1500)
 
-                # Safely retrieve the page HTML; if navigation started again retry once.
-                try:
-                    html = await page.content()
-                except Exception as inner_e:
-                    # transient navigation issue — short pause and retry
-                    await page.wait_for_timeout(800)
-                    html = await page.content()
+                    # Small extra delay to let client-side hydration update price DOM if necessary
+                    await page.wait_for_timeout(300)
 
-                # ensure browser is closed even on intermediate errors
-                await browser.close()
-        except Exception as e:
-            # If caller requested continuous retries, swallow transient errors
-            if wait_for_price_and_title:
-                logger.warning(
-                    "Scrape attempt %d failed: %s — retrying in %.1fs",
-                    attempts,
-                    str(e),
-                    retry_delay,
-                )
-                if max_attempts and attempts >= max_attempts:
-                    raise HTTPException(status_code=500, detail=f"Failed after {attempts} attempts: {e}")
-                await asyncio.sleep(retry_delay)
-                continue
-            raise HTTPException(status_code=500, detail=f"Failed to fetch URL: {str(e)}")
+                    # Best-effort: wait a short time for any visible currency/price text to appear
+                    try:
+                        await page.wait_for_function(
+                            "!!(document.body && /[£€$]\\s*[\\d,\\.]+|\\b[\\d\\.,]+\\s*(?:GBP|EUR|USD)\\b/.test(document.body.innerText))",
+                            timeout=3000,
+                        )
+                    except Exception:
+                        # not critical — continue and try to extract from HTML/JSON
+                        pass
+
+                    # Safely retrieve the page HTML; if navigation started again retry once.
+                    try:
+                        html = await page.content()
+                    except Exception as inner_e:
+                        # transient navigation issue — short pause and retry
+                        await page.wait_for_timeout(800)
+                        html = await page.content()
+
+                    # Try to capture rendered price text directly from the client DOM (helps complex SPA renderings)
+                    try:
+                        playwright_price = await page.evaluate(r"""
+                            (() => {
+                                const selectors = [
+                                    '[data-testid*="price"]', '[data-qa*="price"]', '[data-test*="price"]',
+                                    '[data-test-id*="price"]', '.price-amount', '.product-price', '.product-pricing',
+                                    '.price', 'span[class*=price]', '.price-amount__integer', '.price-amount__fraction'
+                                ];
+
+                                for (const sel of selectors) {
+                                    const el = document.querySelector(sel);
+                                    if (el && el.innerText && /\d/.test(el.innerText)) {
+                                        return el.innerText.trim();
+                                    }
+                                }
+
+                                // common split-price pattern (integer + fraction)
+                                const intEl = document.querySelector('.price-amount__integer, [data-qa="price-int"], .price-int');
+                                const decEl = document.querySelector('.price-amount__fraction, [data-qa="price-decimal"], .price-decimal');
+                                if (intEl) {
+                                    const i = (intEl.innerText || '').replace(/[^\d]/g, '');
+                                    const d = decEl ? ('.' + (decEl.innerText || '').replace(/[^\d]/g, '')) : '';
+                                    return (i ? i + d : null);
+                                }
+
+                                return null;
+                            })()
+                        """)
+                        if playwright_price:
+                            rendered_price_text = playwright_price
+                            logger.info("Playwright extracted rendered price text: %s", rendered_price_text)
+                    except Exception:
+                        # non-fatal — parsing will continue via BeautifulSoup fallbacks
+                        rendered_price_text = rendered_price_text
+
+                    # If Playwright didn't find a price and stylesheets were blocked, retry once with stylesheets enabled
+                    if not rendered_price_text and not allow_stylesheets:
+                        try:
+                            logger.info("Retrying Playwright with stylesheets enabled for %s", url)
+                            # create a second context that allows stylesheets (only block images/fonts)
+                            second_ctx = await browser.new_context(
+                                user_agent=(
+                                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+                                ),
+                                viewport={"width": 1920, "height": 1080},
+                                locale="en-GB",
+                            )
+                            page2 = await second_ctx.new_page()
+                            page2.set_default_navigation_timeout(60000)
+                            page2.set_default_timeout(60000)
+
+                            async def _allow_styles_route(route, request):
+                                if request.resource_type in ("image", "media", "font"):
+                                    await route.abort()
+                                else:
+                                    await route.continue_()
+
+                            await second_ctx.route("**/*", _allow_styles_route)
+
+                            try:
+                                await page2.goto(url, wait_until="domcontentloaded", timeout=45000)
+                            except Exception:
+                                await page2.goto(url, wait_until="domcontentloaded", timeout=90000)
+
+                            await page2.wait_for_timeout(800)
+
+                            try:
+                                playwright_price2 = await page2.evaluate(r"""
+                                    (() => {
+                                        const selectors = [
+                                            '[data-testid*="price"]', '[data-qa*="price"]', '[data-test*="price"]',
+                                            '[data-test-id*="price"]', '.price-amount', '.product-price', '.product-pricing',
+                                            '.price', 'span[class*=price]', '.price-amount__integer', '.price-amount__fraction'
+                                        ];
+
+                                        for (const sel of selectors) {
+                                            const el = document.querySelector(sel);
+                                            if (el && el.innerText && /\d/.test(el.innerText)) {
+                                                return el.innerText.trim();
+                                            }
+                                        }
+
+                                        const intEl = document.querySelector('.price-amount__integer, [data-qa="price-int"], .price-int');
+                                        const decEl = document.querySelector('.price-amount__fraction, [data-qa="price-decimal"], .price-decimal');
+                                        if (intEl) {
+                                            const i = (intEl.innerText || '').replace(/[^\d]/g, '');
+                                            const d = decEl ? ('.' + (decEl.innerText || '').replace(/[^\d]/g, '')) : '';
+                                            return (i ? i + d : null);
+                                        }
+
+                                        return null;
+                                    })()
+                                """)
+                                if playwright_price2:
+                                    rendered_price_text = playwright_price2
+                                    logger.info("Playwright (styles) extracted rendered price text: %s", rendered_price_text)
+                                    
+                                    # Only use the stylesheet HTML if we successfully found price data
+                                    try:
+                                        html2 = await page2.content()
+                                        # Quick sanity check: does new HTML have a title?
+                                        if html2 and '<title>' in html2:
+                                            html = html2
+                                            logger.info("Using stylesheet-enabled HTML (contains title and price)")
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+
+                            await second_ctx.close()
+                        except Exception:
+                            logger.exception("Playwright stylesheet retry failed for %s", url)
+
+                    # ensure browser is closed even on intermediate errors
+                    await browser.close()
+            except NotImplementedError as e:
+                # Playwright can't spawn subprocesses in this environment (common on some Windows setups).
+                logger.warning("Playwright subprocess unavailable: %s", e)
+
+                # If the caller expects to *wait* for JS-rendered price/title, surface a clear 503 immediately
+                if wait_for_price_and_title and not html:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Playwright is not available in this environment; JS-rendered price/title cannot be retrieved. "
+                            "Run the app where Playwright can spawn browsers or provide a product URL that exposes structured data/meta tags."
+                        ),
+                    )
+
+                # Otherwise (background jobs / manual checks) if we have no HTTP HTML, return an error so caller can handle/log it
+                if not html:
+                    raise HTTPException(status_code=500, detail="Playwright unavailable and HTTP fetch returned no content")
+
+                # if we do have HTML from the HTTP-only fetch, continue to parse that content (no-op here)
+            except Exception as e:
+                # If caller requested continuous retries, swallow transient errors
+                if wait_for_price_and_title:
+                    logger.warning(
+                        "Scrape attempt %d failed: %s — retrying in %.1fs",
+                        attempts,
+                        str(e),
+                        retry_delay,
+                    )
+                    if max_attempts and attempts >= max_attempts:
+                        raise HTTPException(status_code=500, detail=f"Failed after {attempts} attempts: {e}")
+                    await asyncio.sleep(retry_delay)
+                    continue
+                raise HTTPException(status_code=500, detail=f"Failed to fetch URL: {str(e)}")
 
         # Parse HTML
         soup = BeautifulSoup(html, "html.parser")
@@ -303,6 +521,91 @@ async def scrape_backmarket_product(
             if title_elem:
                 product_info.title = title_elem.get_text(strip=True)
 
+        # Additional: parse Next.js / inline JSON blobs and scan data-* attributes for price information
+        if not product_info.price:
+            # recursive search helper for JSON blobs
+            def _search_json_for_price(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if re.search(r'price|amount|offers', k, re.I):
+                            if isinstance(v, (int, float, str)) and re.search(r'\d', str(v)):
+                                return str(v)
+                        found = _search_json_for_price(v)
+                        if found:
+                            return found
+                elif isinstance(obj, list):
+                    for item in obj:
+                        found = _search_json_for_price(item)
+                        if found:
+                            return found
+                return None
+
+            # 1) Look for __NEXT_DATA__ / application/json blobs (common in SSR/Next.js apps)
+            next_data_script = soup.find("script", id="__NEXT_DATA__", type="application/json")
+            if not next_data_script:
+                # fallback to any JSON script blocks used by some apps
+                next_data_script = soup.find("script", type="application/json")
+
+            if next_data_script:
+                try:
+                    nd = json.loads(next_data_script.string or "{}")
+                    found = _search_json_for_price(nd)
+                    if found:
+                        product_info.price = found.replace(",", "")
+
+                        # try to find explicit currency nearby in the same JSON
+                        def _search_json_for_currency(obj):
+                            if isinstance(obj, dict):
+                                for k, v in obj.items():
+                                    if re.search(r'priceCurrency', k, re.I) and isinstance(v, str) and v:
+                                        return v
+                                    res = _search_json_for_currency(v)
+                                    if res:
+                                        return res
+                            elif isinstance(obj, list):
+                                for item in obj:
+                                    res = _search_json_for_currency(item)
+                                    if res:
+                                        return res
+                            return None
+
+                        cur = _search_json_for_currency(nd)
+                        if cur:
+                            if cur in ("GBP", "EUR", "USD"):
+                                product_info.currency = product_info.currency or cur
+                            elif cur == '£':
+                                product_info.currency = product_info.currency or 'GBP'
+                            elif cur == '€':
+                                product_info.currency = product_info.currency or 'EUR'
+                            elif cur == '$':
+                                product_info.currency = product_info.currency or 'USD'
+
+                        logger.info("Found price in JSON blob: %s %s", product_info.price, product_info.currency)
+                except Exception:
+                    pass
+
+            # 2) Scan attributes (data-price, data-amount, aria-labels etc.) for values containing a numeric price
+            if not product_info.price:
+                for tag in soup.find_all():
+                    for attr_name, attr_val in tag.attrs.items():
+                        if re.search(r'price', attr_name, re.I):
+                            av = attr_val
+                            if isinstance(av, (list, tuple)):
+                                av = " ".join(map(str, av))
+                            m = re.search(r'[\d\.,]+', str(av))
+                            if m:
+                                product_info.price = m.group(0).replace(",", "")
+                                if '€' in str(av):
+                                    product_info.currency = product_info.currency or 'EUR'
+                                elif '£' in str(av):
+                                    product_info.currency = product_info.currency or 'GBP'
+                                elif '$' in str(av):
+                                    product_info.currency = product_info.currency or 'USD'
+                                logger.info("Found price in element attribute %s: %s", attr_name, product_info.price)
+                                break
+                    if product_info.price:
+                        break
+
         # Try to find price from meta tags
         if not product_info.price:
             price_meta = soup.find("meta", property="product:price:amount")
@@ -312,8 +615,9 @@ async def scrape_backmarket_product(
             if currency_meta:
                 product_info.currency = currency_meta.get("content")
 
-        # Additional fallback: look for visible price text or itemprop attributes
+        # Additional fallback: look for visible price text, itemprop attributes, inline script JSON, or page text
         if not product_info.price:
+            # 1) Visible elements (class/itemprop)
             price_item = soup.find(attrs={"itemprop": "price"}) or soup.find(class_=re.compile(r"price", re.I))
             if price_item:
                 text = price_item.get_text(" ", strip=True)
@@ -330,17 +634,73 @@ async def scrape_backmarket_product(
                     elif '$' in extracted or 'USD' in extracted:
                         product_info.currency = product_info.currency or "USD"
 
-        # Try to find image from og:image
-        if not product_info.image_url:
-            og_image = soup.find("meta", property="og:image")
-            if og_image:
-                product_info.image_url = og_image.get("content")
+            # 2) Scan inline <script> blocks for JSON-like price keys (common when site injects data)
+            if not product_info.price:
+                for script in soup.find_all("script"):
+                    s = script.string or script.get_text()
+                    if not s:
+                        continue
+                    # avoid huge blobs
+                    if len(s) > 200000:
+                        continue
 
-        # Try to find description from meta
-        if not product_info.description:
-            desc_meta = soup.find("meta", attrs={"name": "description"})
-            if desc_meta:
-                product_info.description = desc_meta.get("content")
+                    # Try common JSON patterns: "price": "1234"  or  "amount": 1234
+                    m1 = re.search(r'"price"\s*:\s*"?([\d\.,]+)"?', s)
+                    m2 = re.search(r'"amount"\s*:\s*([\d\.]+)', s)
+                    # also allow single-quoted or unquoted price keys
+                    m3 = re.search(r"(?:'price'|price)\s*:\s*'?([\d\.,]+)'?", s)
+                    m4 = re.search(r"(?:'amount'|amount)\s*:\s*([\d\.]+)", s)
+                    if m1:
+                        product_info.price = m1.group(1).replace(",", "")
+                    elif m2:
+                        product_info.price = m2.group(1)
+                    elif m3:
+                        product_info.price = m3.group(1).replace(",", "")
+                    elif m4:
+                        product_info.price = m4.group(1)
+
+                    if product_info.price:
+                        # try to extract currency nearby
+                        c = re.search(r'"priceCurrency"\s*:\s*"?([A-Z]{3}|[£€$])"?', s) or re.search(r"(?:'priceCurrency'|priceCurrency)\s*:\s*'?([A-Z]{3}|[£€$])'?", s)
+                        if c:
+                            cur = c.group(1)
+                            if cur in ("GBP", "EUR", "USD"):
+                                product_info.currency = product_info.currency or cur
+                            elif cur == '£':
+                                product_info.currency = product_info.currency or 'GBP'
+                            elif cur == '€':
+                                product_info.currency = product_info.currency or 'EUR'
+                            elif cur == '$':
+                                product_info.currency = product_info.currency or 'USD'
+                        logger.info("Found price in inline script: %s %s", product_info.price, product_info.currency)
+                        break
+
+            # 3) If still not found, use Playwright-evaluated rendered text (helps SPA-only renderings)
+            if not product_info.price and rendered_price_text:
+                rp = rendered_price_text
+                m = re.search(r"([£€$]\s?[\d\.,]+)|([\d\.,]+\s?(?:GBP|EUR|USD|£|€|\$))|([\d\.,]+)", rp)
+                if m:
+                    extracted = m.group(1) or m.group(2) or m.group(3)
+                    num_match = re.search(r"[\d\.,]+", extracted)
+                    if num_match:
+                        product_info.price = num_match.group(0).replace(",", "")
+                        if '£' in extracted or 'GBP' in extracted:
+                            product_info.currency = product_info.currency or "GBP"
+                        elif '€' in extracted or 'EUR' in extracted:
+                            product_info.currency = product_info.currency or "EUR"
+                        elif '$' in extracted or 'USD' in extracted:
+                            product_info.currency = product_info.currency or "USD"
+                        logger.info("Found price from Playwright DOM-eval: %s %s", product_info.price, product_info.currency)
+
+            # 4) Last resort: search whole page text for currency followed by number
+            if not product_info.price:
+                text = soup.get_text()
+                m = re.search(r"([£€$]\s?[\d\.,]+)|([\d\.,]+\s?(?:GBP|EUR|USD))", text)
+                if m:
+                    extracted = m.group(0)
+                    num_match = re.search(r"[\d\.,]+", extracted)
+                    if num_match:
+                        product_info.price = num_match.group(0).replace(",", "")
 
         # If caller requires both title and price, retry until both are present
         if wait_for_price_and_title and (not product_info.price or not product_info.title):
@@ -432,7 +792,10 @@ async def preflight_handler(rest_of_path: str, response: Response):
 
 
 @app.get("/get", response_model=ProductInfo)
-async def get_product_info(url: str = Query(..., description="BackMarket product URL")):
+async def get_product_info(
+    url: str = Query(..., description="BackMarket product URL"),
+    allow_stylesheets: bool = Query(False, description="Allow loading stylesheets in Playwright (may slow scraping)")
+):
     """
     Get information about a BackMarket product.
     If the product is already tracked, returns cached data immediately
@@ -469,6 +832,7 @@ async def get_product_info(url: str = Query(..., description="BackMarket product
             wait_for_price_and_title=True,
             max_attempts=12,
             retry_delay=3.0,
+            allow_stylesheets=allow_stylesheets,
         )
         product_info.refreshing = False
         return product_info
