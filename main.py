@@ -149,144 +149,183 @@ class ProductInfo(BaseModel):
     refreshing: bool = False
 
 
-async def scrape_backmarket_product(url: str, save_to_db: bool = True) -> ProductInfo:
-    """Scrape product information from a BackMarket product page."""
+async def scrape_backmarket_product(
+    url: str,
+    save_to_db: bool = True,
+    wait_for_price_and_title: bool = False,
+    max_attempts: int | None = None,
+    retry_delay: float = 3.0,
+) -> ProductInfo:
+    """Scrape product information from a BackMarket product page.
+
+    If `wait_for_price_and_title` is True the function will retry the whole
+    fetch+parse loop until both `title` and `price` are present (or until
+    `max_attempts` is reached). This is used by the `/get` endpoint for new
+    products so callers can block until useful data is available.
+    """
 
     if "backmarket." not in url:
         raise HTTPException(status_code=400, detail="URL must be a BackMarket product URL")
 
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080},
-                locale="en-GB",
-            )
-            page = await context.new_page()
+    attempts = 0
+    html = None
 
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(2000)  # Wait for dynamic content
+    while True:
+        attempts += 1
 
-            html = await page.content()
-            await browser.close()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch URL: {str(e)}")
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    product_info = ProductInfo(url=url)
-
-    # Try to extract data from JSON-LD structured data
-    json_ld_script = soup.find("script", type="application/ld+json")
-    if json_ld_script:
         try:
-            json_data = json.loads(json_ld_script.string)
-            if isinstance(json_data, list):
-                for item in json_data:
-                    if item.get("@type") == "Product":
-                        json_data = item
-                        break
-
-            if json_data.get("@type") == "Product":
-                product_info.title = json_data.get("name")
-                product_info.description = json_data.get("description")
-                product_info.image_url = json_data.get("image")
-
-                offers = json_data.get("offers", {})
-                if isinstance(offers, list) and offers:
-                    offers = offers[0]
-                if offers:
-                    product_info.price = str(offers.get("price"))
-                    product_info.currency = offers.get("priceCurrency")
-
-                brand = json_data.get("brand", {})
-                if isinstance(brand, dict):
-                    product_info.seller = brand.get("name")
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    # Fallback: Extract from HTML elements
-    if not product_info.title:
-        title_elem = soup.find("h1")
-        if title_elem:
-            product_info.title = title_elem.get_text(strip=True)
-
-    # Try to find price from meta tags
-    if not product_info.price:
-        price_meta = soup.find("meta", property="product:price:amount")
-        if price_meta:
-            product_info.price = price_meta.get("content")
-        currency_meta = soup.find("meta", property="product:price:currency")
-        if currency_meta:
-            product_info.currency = currency_meta.get("content")
-
-    # Try to find image from og:image
-    if not product_info.image_url:
-        og_image = soup.find("meta", property="og:image")
-        if og_image:
-            product_info.image_url = og_image.get("content")
-
-    # Try to find description from meta
-    if not product_info.description:
-        desc_meta = soup.find("meta", attrs={"name": "description"})
-        if desc_meta:
-            product_info.description = desc_meta.get("content")
-
-    # Save to database if enabled
-    if save_to_db:
-        async with async_session() as session:
-            # Check if product already exists
-            result = await session.execute(select(Product).where(Product.url == url))
-            product = result.scalar_one_or_none()
-
-            price_float = float(product_info.price) if product_info.price else None
-
-            if product:
-                # Update existing product
-                old_price = product.current_price
-                product.title = product_info.title
-                product.current_price = price_float
-                product.currency = product_info.currency
-                product.image_url = product_info.image_url
-                product.description = product_info.description
-                product.seller = product_info.seller
-                product.updated_at = utc_now()
-
-                # Record price change if different
-                if price_float and old_price != price_float:
-                    price_record = PriceHistory(
-                        product_id=product.id,
-                        price=price_float,
-                        currency=product_info.currency
-                    )
-                    session.add(price_record)
-            else:
-                # Create new product
-                product = Product(
-                    url=url,
-                    title=product_info.title,
-                    current_price=price_float,
-                    currency=product_info.currency,
-                    image_url=product_info.image_url,
-                    description=product_info.description,
-                    seller=product_info.seller,
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1920, "height": 1080},
+                    locale="en-GB",
                 )
-                session.add(product)
-                await session.flush()  # Get the product ID
+                page = await context.new_page()
 
-                # Record initial price
-                if price_float:
-                    price_record = PriceHistory(
-                        product_id=product.id,
-                        price=price_float,
-                        currency=product_info.currency
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(2000)  # Wait for dynamic content
+
+                html = await page.content()
+                await browser.close()
+        except Exception as e:
+            # If caller requested continuous retries, swallow transient errors
+            if wait_for_price_and_title:
+                print(f"Scrape attempt {attempts} failed: {e} — retrying in {retry_delay}s")
+                if max_attempts and attempts >= max_attempts:
+                    raise HTTPException(status_code=500, detail=f"Failed after {attempts} attempts: {e}")
+                await asyncio.sleep(retry_delay)
+                continue
+            raise HTTPException(status_code=500, detail=f"Failed to fetch URL: {str(e)}")
+
+        # Parse HTML
+        soup = BeautifulSoup(html, "html.parser")
+        product_info = ProductInfo(url=url)
+
+        # Try to extract data from JSON-LD structured data
+        json_ld_script = soup.find("script", type="application/ld+json")
+        if json_ld_script:
+            try:
+                json_data = json.loads(json_ld_script.string)
+                if isinstance(json_data, list):
+                    for item in json_data:
+                        if item.get("@type") == "Product":
+                            json_data = item
+                            break
+
+                if json_data.get("@type") == "Product":
+                    product_info.title = json_data.get("name")
+                    product_info.description = json_data.get("description")
+                    product_info.image_url = json_data.get("image")
+
+                    offers = json_data.get("offers", {})
+                    if isinstance(offers, list) and offers:
+                        offers = offers[0]
+                    if offers:
+                        product_info.price = str(offers.get("price"))
+                        product_info.currency = offers.get("priceCurrency")
+
+                    brand = json_data.get("brand", {})
+                    if isinstance(brand, dict):
+                        product_info.seller = brand.get("name")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Fallback: Extract from HTML elements
+        if not product_info.title:
+            title_elem = soup.find("h1")
+            if title_elem:
+                product_info.title = title_elem.get_text(strip=True)
+
+        # Try to find price from meta tags
+        if not product_info.price:
+            price_meta = soup.find("meta", property="product:price:amount")
+            if price_meta:
+                product_info.price = price_meta.get("content")
+            currency_meta = soup.find("meta", property="product:price:currency")
+            if currency_meta:
+                product_info.currency = currency_meta.get("content")
+
+        # Try to find image from og:image
+        if not product_info.image_url:
+            og_image = soup.find("meta", property="og:image")
+            if og_image:
+                product_info.image_url = og_image.get("content")
+
+        # Try to find description from meta
+        if not product_info.description:
+            desc_meta = soup.find("meta", attrs={"name": "description"})
+            if desc_meta:
+                product_info.description = desc_meta.get("content")
+
+        # If caller requires both title and price, retry until both are present
+        if wait_for_price_and_title and (not product_info.price or not product_info.title):
+            print(
+                f"Scrape attempt {attempts} returned incomplete data (title: {bool(product_info.title)}, "
+                f"price: {bool(product_info.price)}). Retrying in {retry_delay}s..."
+            )
+            if max_attempts and attempts >= max_attempts:
+                raise HTTPException(status_code=500, detail=f"Failed to retrieve title and price after {attempts} attempts")
+            await asyncio.sleep(retry_delay)
+            continue
+
+        # Save to database if enabled (unchanged behaviour)
+        if save_to_db:
+            async with async_session() as session:
+                # Check if product already exists
+                result = await session.execute(select(Product).where(Product.url == url))
+                product = result.scalar_one_or_none()
+
+                price_float = float(product_info.price) if product_info.price else None
+
+                if product:
+                    # Update existing product
+                    old_price = product.current_price
+                    product.title = product_info.title
+                    product.current_price = price_float
+                    product.currency = product_info.currency
+                    product.image_url = product_info.image_url
+                    product.description = product_info.description
+                    product.seller = product_info.seller
+                    product.updated_at = utc_now()
+
+                    # Record price change if different
+                    if price_float and old_price != price_float:
+                        price_record = PriceHistory(
+                            product_id=product.id,
+                            price=price_float,
+                            currency=product_info.currency
+                        )
+                        session.add(price_record)
+                else:
+                    # Create new product
+                    product = Product(
+                        url=url,
+                        title=product_info.title,
+                        current_price=price_float,
+                        currency=product_info.currency,
+                        image_url=product_info.image_url,
+                        description=product_info.description,
+                        seller=product_info.seller,
                     )
-                    session.add(price_record)
+                    session.add(product)
+                    await session.flush()  # Get the product ID
 
-            await session.commit()
+                    # Record initial price
+                    if price_float:
+                        price_record = PriceHistory(
+                            product_id=product.id,
+                            price=price_float,
+                            currency=product_info.currency
+                        )
+                        session.add(price_record)
 
-    return product_info
+                await session.commit()
+
+        return product_info
 
 
 async def background_scrape(url: str):
@@ -339,8 +378,14 @@ async def get_product_info(url: str = Query(..., description="BackMarket product
             refreshing=True
         )
     else:
-        # New product — must scrape synchronously to have any data
-        product_info = await scrape_backmarket_product(url, save_to_db=True)
+        # New product — wait (up to 12 attempts, 3s interval) until price & title are available
+        product_info = await scrape_backmarket_product(
+            url,
+            save_to_db=True,
+            wait_for_price_and_title=True,
+            max_attempts=12,
+            retry_delay=3.0,
+        )
         product_info.refreshing = False
         return product_info
 
