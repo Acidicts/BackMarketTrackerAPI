@@ -209,10 +209,30 @@ async def scrape_backmarket_product(
                 )
                 page = await context.new_page()
 
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(2000)  # Wait for dynamic content
+                # Wait for network to be idle (SPA friendly) and then wait for either
+                # structured data or price metadata to appear. This avoids calling
+                # `page.content()` while the page is still navigating/changing.
+                await page.goto(url, wait_until="networkidle", timeout=45000)
 
-                html = await page.content()
+                # Prefer waiting for JSON-LD or explicit price meta tag (fastest path).
+                try:
+                    await page.wait_for_selector('script[type="application/ld+json"]', timeout=8000)
+                except Exception:
+                    try:
+                        await page.wait_for_selector('meta[property="product:price:amount"]', timeout=8000)
+                    except Exception:
+                        # Best-effort fallback for pages that render slowly
+                        await page.wait_for_timeout(2000)
+
+                # Safely retrieve the page HTML; if navigation started again retry once.
+                try:
+                    html = await page.content()
+                except Exception as inner_e:
+                    # transient navigation issue — short pause and retry
+                    await page.wait_for_timeout(800)
+                    html = await page.content()
+
+                # ensure browser is closed even on intermediate errors
                 await browser.close()
         except Exception as e:
             # If caller requested continuous retries, swallow transient errors
