@@ -35,6 +35,9 @@ Manually trigger a price check for a specific tracked product.
 ### `GET /check-all`
 Manually trigger a price check for all tracked products.
 
+### `DELETE /products/{product_id}`
+Delete a tracked product and its price history.
+
 ## Deployment
 
 ### Using Docker
