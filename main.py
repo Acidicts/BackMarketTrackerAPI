@@ -637,6 +637,32 @@ async def list_tracked_products():
         ]
 
 
+@app.delete("/products/{product_id}")
+async def delete_tracked_product(product_id: int):
+    """
+    Delete a tracked product (by ID) and its price history.
+    The product row is removed and subsequent product listings will naturally "move up".
+    """
+    async with async_session() as session:
+        product = await session.get(Product, product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        # Deleting the Product object will also remove related PriceHistory rows
+        # because the relationship uses cascade="all, delete-orphan".
+        await session.delete(product)
+        await session.commit()
+
+        # Return confirmation and remaining product count so clients can refresh/list again
+        result = await session.execute(select(Product).order_by(Product.updated_at.desc()))
+        remaining = result.scalars().all()
+        return {
+            "message": "Product deleted",
+            "deleted_id": product_id,
+            "remaining_count": len(remaining)
+        }
+
+
 @app.get("/check")
 async def check_price(url: str = Query(..., description="Product URL to check")):
     """
