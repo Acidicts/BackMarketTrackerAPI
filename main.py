@@ -21,6 +21,29 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./db/backmarket.db
 # Ensure db directory exists
 os.makedirs("db", exist_ok=True)
 
+# --- logging setup -------------------------------------------------
+import logging
+
+# module logger used for retries, background tasks and errors
+logger = logging.getLogger("backmarket")
+logger.setLevel(logging.INFO)
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+logger.addHandler(_stream_handler)
+
+# Filter that suppresses uvicorn access log entries for HTTP GET requests
+class _ExcludeGetFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if record.name.startswith("uvicorn.access") and (" GET " in msg or msg.strip().startswith("GET ")):
+            return False
+        return True
+
+logging.getLogger("uvicorn.access").addFilter(_ExcludeGetFilter())
+# ------------------------------------------------------------------
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -95,13 +118,13 @@ async def price_checker_task():
                                 product.current_price = new_price
                                 product.updated_at = utc_now()
                         await asyncio.sleep(5)  # Rate limiting between requests
-                    except Exception as e:
-                        print(f"Error checking price for {product.url}: {e}")
+                    except Exception:
+                        logger.exception("Error checking price for %s", product.url)
                         continue
 
                 await session.commit()
-        except Exception as e:
-            print(f"Price checker error: {e}")
+        except Exception:
+            logger.exception("Price checker error")
 
 
 @asynccontextmanager
@@ -194,7 +217,12 @@ async def scrape_backmarket_product(
         except Exception as e:
             # If caller requested continuous retries, swallow transient errors
             if wait_for_price_and_title:
-                print(f"Scrape attempt {attempts} failed: {e} — retrying in {retry_delay}s")
+                logger.warning(
+                    "Scrape attempt %d failed: %s — retrying in %.1fs",
+                    attempts,
+                    str(e),
+                    retry_delay,
+                )
                 if max_attempts and attempts >= max_attempts:
                     raise HTTPException(status_code=500, detail=f"Failed after {attempts} attempts: {e}")
                 await asyncio.sleep(retry_delay)
@@ -263,9 +291,12 @@ async def scrape_backmarket_product(
 
         # If caller requires both title and price, retry until both are present
         if wait_for_price_and_title and (not product_info.price or not product_info.title):
-            print(
-                f"Scrape attempt {attempts} returned incomplete data (title: {bool(product_info.title)}, "
-                f"price: {bool(product_info.price)}). Retrying in {retry_delay}s..."
+            logger.info(
+                "Scrape attempt %d returned incomplete data (title=%s, price=%s). Retrying in %.1fs...",
+                attempts,
+                bool(product_info.title),
+                bool(product_info.price),
+                retry_delay,
             )
             if max_attempts and attempts >= max_attempts:
                 raise HTTPException(status_code=500, detail=f"Failed to retrieve title and price after {attempts} attempts")
@@ -332,9 +363,9 @@ async def background_scrape(url: str):
     """Scrape a product in the background and update the database."""
     try:
         await scrape_backmarket_product(url, save_to_db=True)
-        print(f"Background scrape completed for {url}")
-    except Exception as e:
-        print(f"Background scrape failed for {url}: {e}")
+        logger.info("Background scrape completed for %s", url)
+    except Exception:
+        logger.exception("Background scrape failed for %s", url)
 
 
 # Catch-all OPTIONS handler for CORS preflight requests
