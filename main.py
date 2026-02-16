@@ -6,6 +6,7 @@ from starlette.requests import Request
 from pydantic import BaseModel
 from bs4 import BeautifulSoup
 import json
+import re
 from playwright.async_api import async_playwright
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -198,7 +199,7 @@ async def scrape_backmarket_product(
 
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
                 context = await browser.new_context(
                     user_agent=(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -208,21 +209,35 @@ async def scrape_backmarket_product(
                     locale="en-GB",
                 )
                 page = await context.new_page()
+                # set reasonable timeouts for this page
+                page.set_default_navigation_timeout(60000)
+                page.set_default_timeout(60000)
 
-                # Wait for network to be idle (SPA friendly) and then wait for either
-                # structured data or price metadata to appear. This avoids calling
-                # `page.content()` while the page is still navigating/changing.
-                await page.goto(url, wait_until="networkidle", timeout=45000)
+                # Block large/unnecessary resources (images/fonts/analytics) to speed navigation
+                async def _block_resource(route, request):
+                    if request.resource_type in ("image", "media", "font", "stylesheet"):
+                        await route.abort()
+                    else:
+                        await route.continue_()
+
+                await context.route("**/*", _block_resource)
+
+                # Navigate using DOMContentLoaded (avoids indefinite network activity from analytics)
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                except Exception:
+                    # second attempt with a longer timeout before giving up
+                    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
                 # Prefer waiting for JSON-LD or explicit price meta tag (fastest path).
                 try:
-                    await page.wait_for_selector('script[type="application/ld+json"]', timeout=8000)
+                    await page.wait_for_selector('script[type="application/ld+json"]', timeout=12000)
                 except Exception:
                     try:
-                        await page.wait_for_selector('meta[property="product:price:amount"]', timeout=8000)
+                        await page.wait_for_selector('meta[property="product:price:amount"]', timeout=12000)
                     except Exception:
                         # Best-effort fallback for pages that render slowly
-                        await page.wait_for_timeout(2000)
+                        await page.wait_for_timeout(1500)
 
                 # Safely retrieve the page HTML; if navigation started again retry once.
                 try:
@@ -296,6 +311,24 @@ async def scrape_backmarket_product(
             currency_meta = soup.find("meta", property="product:price:currency")
             if currency_meta:
                 product_info.currency = currency_meta.get("content")
+
+        # Additional fallback: look for visible price text or itemprop attributes
+        if not product_info.price:
+            price_item = soup.find(attrs={"itemprop": "price"}) or soup.find(class_=re.compile(r"price", re.I))
+            if price_item:
+                text = price_item.get_text(" ", strip=True)
+                m = re.search(r"([£€$]\s?[\d\.,]+)|([\d\.,]+\s?(?:GBP|EUR|USD|£|€|\$))", text)
+                if m:
+                    extracted = m.group(0)
+                    num_match = re.search(r"[\d\.,]+", extracted)
+                    if num_match:
+                        product_info.price = num_match.group(0).replace(",", "")
+                    if '£' in extracted or 'GBP' in extracted:
+                        product_info.currency = product_info.currency or "GBP"
+                    elif '€' in extracted or 'EUR' in extracted:
+                        product_info.currency = product_info.currency or "EUR"
+                    elif '$' in extracted or 'USD' in extracted:
+                        product_info.currency = product_info.currency or "USD"
 
         # Try to find image from og:image
         if not product_info.image_url:
