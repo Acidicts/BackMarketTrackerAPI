@@ -40,7 +40,32 @@ Delete a tracked product and its price history.
 
 ## Deployment
 
-### Using Docker
+### Using Pre-built Docker Image (Recommended for Production)
+
+For production deployments (e.g., Coolify, Portainer), use the pre-built image from GitHub Container Registry:
+
+```bash
+docker-compose -f docker-compose.prod.yml up -d
+```
+
+This pulls the latest image from `ghcr.io/acidicts/backmarkettrackerapi:latest` and avoids DNS/network issues during deployment.
+
+The API will be available at `http://localhost:8000`.
+
+#### Coolify Deployment
+
+When deploying to Coolify:
+
+1. The GitHub Actions workflow automatically builds and pushes Docker images to GHCR on every push to `main`
+2. In Coolify, configure your application to use **Docker Image** as the build pack
+3. Set the Docker image to: `ghcr.io/acidicts/backmarkettrackerapi:latest`
+4. Alternatively, use the `docker-compose.prod.yml` file in your Coolify deployment settings
+
+This approach bypasses the git clone step that was causing DNS resolution errors in Coolify's helper container.
+
+### Using Docker (Local Development)
+
+Build and run locally:
 
 ```bash
 docker-compose up -d
@@ -50,10 +75,12 @@ The API will be available at `http://localhost:8000`.
 
 ### Using Docker with PostgreSQL
 
-Edit `docker-compose.yml` and uncomment the PostgreSQL configuration, then:
+Edit `docker-compose.yml` or `docker-compose.prod.yml` and uncomment the PostgreSQL configuration, then:
 
 ```bash
 docker-compose up -d
+# or for production:
+docker-compose -f docker-compose.prod.yml up -d
 ```
 
 ### Manual Installation
