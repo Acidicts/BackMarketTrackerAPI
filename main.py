@@ -190,6 +190,7 @@ async def scrape_backmarket_product(
     max_attempts: int | None = None,
     retry_delay: float = 3.0,
     allow_stylesheets: bool = False,
+    use_exponential_backoff: bool = True,
 ) -> ProductInfo:
     """Scrape product information from a BackMarket product page.
 
@@ -197,6 +198,15 @@ async def scrape_backmarket_product(
     fetch+parse loop until both `title` and `price` are present (or until
     `max_attempts` is reached). This is used by the `/get` endpoint for new
     products so callers can block until useful data is available.
+
+    Args:
+        url: The BackMarket product URL to scrape
+        save_to_db: Whether to save the scraped data to the database
+        wait_for_price_and_title: Whether to retry until both price and title are found
+        max_attempts: Maximum number of retry attempts (None = unlimited)
+        retry_delay: Base delay between retries in seconds
+        allow_stylesheets: Whether to allow loading stylesheets in Playwright
+        use_exponential_backoff: Whether to use exponential backoff for retries
     """
 
     if "backmarket." not in url:
@@ -205,9 +215,16 @@ async def scrape_backmarket_product(
     attempts = 0
     html = None
     rendered_price_text: str | None = None
+    last_error: Exception | None = None
 
     while True:
         attempts += 1
+
+        # Calculate retry delay with exponential backoff if enabled
+        current_retry_delay = retry_delay
+        if use_exponential_backoff and attempts > 1:
+            # Exponential backoff: 3s, 6s, 12s, 24s, 48s, then cap at 60s
+            current_retry_delay = min(retry_delay * (2 ** (attempts - 2)), 60.0)
 
         # 1) Fast HTTP fetch first (no subprocesses) — covers most pages that include structured data/meta tags
         try:
@@ -257,8 +274,11 @@ async def scrape_backmarket_product(
 
                     if quick_title or quick_price:
                         html = resp.text
-        except Exception:
-            # ignore HTTP errors — we'll try Playwright below if necessary
+                        logger.info("HTTP fetch successful for %s", url)
+        except Exception as http_error:
+            # Log the error for debugging, but continue to Playwright fallback
+            logger.debug("HTTP fetch failed for %s: %s", url, str(http_error))
+            last_error = http_error
             html = html
 
         # 2) If HTTP fetch didn't return usable HTML (or page requires JS), fall back to Playwright
@@ -468,19 +488,57 @@ async def scrape_backmarket_product(
 
                 # if we do have HTML from the HTTP-only fetch, continue to parse that content (no-op here)
             except Exception as e:
-                # If caller requested continuous retries, swallow transient errors
+                # Store the error for better diagnostics
+                last_error = e
+                error_msg = str(e)
+
+                # Detect network-related errors
+                is_network_error = any(keyword in error_msg.lower() for keyword in [
+                    'err_name_not_resolved', 'dns', 'network', 'connection',
+                    'timeout', 'unreachable', 'failed to establish'
+                ])
+
+                # If caller requested continuous retries, handle transient errors gracefully
                 if wait_for_price_and_title:
-                    logger.warning(
-                        "Scrape attempt %d failed: %s — retrying in %.1fs",
-                        attempts,
-                        str(e),
-                        retry_delay,
-                    )
+                    if is_network_error:
+                        logger.warning(
+                            "Network error on scrape attempt %d: %s — retrying in %.1fs with exponential backoff",
+                            attempts,
+                            error_msg,
+                            current_retry_delay,
+                        )
+                    else:
+                        logger.warning(
+                            "Scrape attempt %d failed: %s — retrying in %.1fs",
+                            attempts,
+                            error_msg,
+                            current_retry_delay,
+                        )
+
                     if max_attempts and attempts >= max_attempts:
-                        raise HTTPException(status_code=500, detail=f"Failed after {attempts} attempts: {e}")
-                    await asyncio.sleep(retry_delay)
+                        # Provide more context about the failure
+                        if is_network_error:
+                            raise HTTPException(
+                                status_code=503,
+                                detail=f"Network connectivity issue after {attempts} attempts. The service may be temporarily unavailable or the URL may be blocked. Last error: {error_msg}"
+                            )
+                        else:
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"Failed after {attempts} attempts: {error_msg}"
+                            )
+
+                    await asyncio.sleep(current_retry_delay)
                     continue
-                raise HTTPException(status_code=500, detail=f"Failed to fetch URL: {str(e)}")
+
+                # If not in retry mode, raise immediately with appropriate status code
+                if is_network_error:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Network connectivity issue: {error_msg}. The service may be temporarily unavailable."
+                    )
+                else:
+                    raise HTTPException(status_code=500, detail=f"Failed to fetch URL: {error_msg}")
 
         # Parse HTML
         soup = BeautifulSoup(html, "html.parser")
@@ -709,11 +767,21 @@ async def scrape_backmarket_product(
                 attempts,
                 bool(product_info.title),
                 bool(product_info.price),
-                retry_delay,
+                current_retry_delay,
             )
             if max_attempts and attempts >= max_attempts:
-                raise HTTPException(status_code=500, detail=f"Failed to retrieve title and price after {attempts} attempts")
-            await asyncio.sleep(retry_delay)
+                # Provide information about what data was found
+                if last_error:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to retrieve complete product data after {attempts} attempts. Found title: {bool(product_info.title)}, Found price: {bool(product_info.price)}. Last error: {str(last_error)}"
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to retrieve complete product data after {attempts} attempts. Found title: {bool(product_info.title)}, Found price: {bool(product_info.price)}"
+                    )
+            await asyncio.sleep(current_retry_delay)
             continue
 
         # Save to database if enabled (unchanged behaviour)
@@ -773,12 +841,31 @@ async def scrape_backmarket_product(
 
 
 async def background_scrape(url: str):
-    """Scrape a product in the background and update the database."""
+    """Scrape a product in the background and update the database.
+
+    This function is designed to be resilient to transient failures.
+    It will not raise exceptions but will log errors for monitoring.
+    """
     try:
-        await scrape_backmarket_product(url, save_to_db=True)
+        await scrape_backmarket_product(
+            url,
+            save_to_db=True,
+            wait_for_price_and_title=False,  # Don't wait/retry in background
+            max_attempts=1,  # Single attempt to avoid blocking
+            allow_stylesheets=False,
+        )
         logger.info("Background scrape completed for %s", url)
-    except Exception:
-        logger.exception("Background scrape failed for %s", url)
+    except HTTPException as http_exc:
+        # Log HTTP exceptions with their status codes
+        logger.warning(
+            "Background scrape failed for %s (HTTP %d): %s",
+            url,
+            http_exc.status_code,
+            http_exc.detail
+        )
+    except Exception as e:
+        # Log all other exceptions
+        logger.exception("Background scrape failed for %s: %s", url, str(e))
 
 
 # Catch-all OPTIONS handler for CORS preflight requests
